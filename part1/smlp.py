@@ -246,14 +246,22 @@ def evaluate(model, dataloader, criterion, device="cpu", verbose=False):
 def train_neural_network_model(training_set, validation_set, num_classes, encoder, save_to,   
                                 hidden_dim=128, dropout=0.1, batch_size=64, learning_rate=1e-3, 
                                 weight_decay=1e-4, num_epochs=20, device=torch.device("cpu"), version='1',
-                                verbose=True):
+                                verbose=True, early_stopping_patience=3,
+                                early_stopping_min_delta=1e-4):
     """Encode texts, train SparseMLP, and checkpoint the best validation model.
 
     Inputs: train/val (text, label) pairs, num_classes, encoder (text -> sparse vector), path prefix to save weights,
-            standard training hyperparameters, and whether to print training progress.
-    Process: vectorise documents, build sparse dataloaders, train for `num_epochs`, save best-by-val-loss.
+            standard training hyperparameters, whether to print training progress, and early-stopping settings.
+    Process: vectorise documents, build sparse dataloaders, train for at most `num_epochs`, save best-by-val-loss,
+             and stop after `early_stopping_patience` epochs without an improvement larger than
+             `early_stopping_min_delta`. Set patience to None to disable early stopping.
     Output: per-epoch metrics list, best epoch index, and validation predictions from the best model.
     """
+    if early_stopping_patience is not None and early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be at least 1 or None")
+    if early_stopping_min_delta < 0:
+        raise ValueError("early_stopping_min_delta must be non-negative")
+
     if isinstance(device, str):
         device = torch.device(device)
         
@@ -333,6 +341,10 @@ def train_neural_network_model(training_set, validation_set, num_classes, encode
     if verbose:
         print("Training...")
     predictions = None
+    best_val_loss = float("inf")
+    best_epoch = None
+    epochs_without_improvement = 0
+
     for epoch in tqdm(range(num_epochs), disable=not verbose):
         # Train the model for one epoch
         train_metrics = train_one_epoch(model, train_loader, optimizer, criterion, device)
@@ -356,18 +368,28 @@ def train_neural_network_model(training_set, validation_set, num_classes, encode
                 f"val acc: {val_metrics['accuracy']:.4f}"
             )
         
-        # Saving the best model according to validation loss
-        if epoch != 0:
-            if val_metrics["loss"] <= best_val_loss:
-                best_val_loss = val_metrics["loss"]
-                torch.save(model.state_dict(), f"{save_to}.pt")
-                best_epoch = epoch
-                predictions = preds
-        else:
+        # A meaningful decrease resets patience and updates the best checkpoint.
+        improvement = best_val_loss - val_metrics["loss"]
+        if improvement > early_stopping_min_delta:
             best_val_loss = val_metrics["loss"]
-            torch.save(model.state_dict(), f"{save_to}.pt")
             best_epoch = epoch
             predictions = preds
+            epochs_without_improvement = 0
+            torch.save(model.state_dict(), f"{save_to}.pt")
+        else:
+            epochs_without_improvement += 1
+
+        if (
+            early_stopping_patience is not None
+            and epochs_without_improvement >= early_stopping_patience
+        ):
+            if verbose:
+                print(
+                    f"Early stopping after epoch {epoch + 1}; "
+                    f"best epoch was {best_epoch + 1} "
+                    f"with validation loss {best_val_loss:.4f}."
+                )
+            break
     
     time_training = time.time()
     if verbose:
