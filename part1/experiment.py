@@ -4,7 +4,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Metaspace
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score
 from pathlib import Path
 from datasets import load_dataset
 from collections import defaultdict, OrderedDict
@@ -111,7 +111,7 @@ def cross_validation_split(pairs, k, seed=0):
 
     return cross_validation_sets
 
-def cross_validation_experiment(data_splits, outcome_space, encoder: 'Encoder', model_option:str, save_to="tmp", loglin_args=dict(), smlp_args=dict()):
+def cross_validation_experiment(data_splits, outcome_space, encoder: 'Encoder', model_option:str, save_to="tmp", loglin_args=dict(), smlp_args=dict(), encoder_factory=None):
     """
     Trains and evaluates k models using a k-fold data split for cross validation. 
     This function returns a dictionary with 
@@ -120,14 +120,20 @@ def cross_validation_experiment(data_splits, outcome_space, encoder: 'Encoder', 
         - accuracies: the accuracy of each trained model on its corresponding validation partition
     
     data_splits: the training/validation folds
-    encoder: an instance of Encoder
+    encoder: an instance of Encoder. May be None when encoder_factory is provided.
+    encoder_factory: optional callable receiving the fold's training texts and returning
+        a freshly fitted Encoder. Use this for representations such as TF-IDF that must
+        be fitted without seeing the validation fold.
     model_option: for now this only supports 'logistic'
         which tells this function to use train_logistic_model (defined earlier in this notebook)
     save_to: folder where to store models
     smlp_args: dict with training arguments for smlp.train_neural_network_model
     """
 
-    models, predictions, accuracies = OrderedDict(), OrderedDict(), OrderedDict()
+    models = OrderedDict()
+    predictions = OrderedDict()
+    accuracies = OrderedDict()
+    macro_f1_scores = OrderedDict()
     
     
     
@@ -135,26 +141,46 @@ def cross_validation_experiment(data_splits, outcome_space, encoder: 'Encoder', 
         training_set = data_splits[fold]["training"]
         validation_set = data_splits[fold]["validation"]
 
+        fold_encoder = encoder
+        if encoder_factory is not None:
+            training_texts = [text for text, _ in training_set]
+            fold_encoder = encoder_factory(training_texts)
+        if fold_encoder is None:
+            raise ValueError("Provide either encoder or encoder_factory")
+
         fold_folder = Path(f"{save_to}/fold-{fold}")
         fold_folder.mkdir(parents=True, exist_ok=True) 
         
         if model_option == 'logistic':                        
-            llmodel = loglin.fit(training_set, encoder, save_to=f'{fold_folder}/model', **loglin_args) 
+            llmodel = loglin.fit(training_set, fold_encoder, save_to=f'{fold_folder}/model', **loglin_args) 
             models[fold] = f'{fold_folder}/model'
             
-            predictions[fold] = loglin.predict([text for text, gold_label in validation_set], llmodel, encoder)    
+            predictions[fold] = loglin.predict([text for text, gold_label in validation_set], llmodel, fold_encoder)    
             gold_labels_validation = [gold_label for text, gold_label in validation_set]
             accuracies[fold] = accuracy_score(gold_labels_validation, predictions[fold])
         elif model_option == 'mlp':            
             metrics, best_epoch, predictions[fold] = smlp.train_neural_network_model(
-                training_set, validation_set, len(outcome_space), encoder, save_to=f'{fold_folder}/model', **smlp_args
+                training_set, validation_set, len(outcome_space), fold_encoder, save_to=f'{fold_folder}/model', **smlp_args
             )
             models[fold] = f'{fold_folder}/model'
             accuracies[fold] = metrics[best_epoch]['val_metrics']['accuracy']            
         else:
             raise ValueError(f"Unkonwn model_option={model_option}")
 
-    return {'models': models, 'predictions': predictions, 'accuracies': accuracies}
+        gold_labels_validation = [gold_label for _, gold_label in validation_set]
+        macro_f1_scores[fold] = f1_score(
+            gold_labels_validation,
+            predictions[fold],
+            average='macro',
+            zero_division=0,
+        )
+
+    return {
+        'models': models,
+        'predictions': predictions,
+        'accuracies': accuracies,
+        'macro_f1_scores': macro_f1_scores,
+    }
 
 
 class WrapperForLoglinearModel(clslib.ProbabilisticModel):

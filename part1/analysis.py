@@ -17,15 +17,20 @@ def make_data_frame(classifiers_data):
         - encoder: this is the encoder used; there's one used for all folds;
         - models: the models trained; this is a list with one per training fold
         - predictions: the predictions of those models; this is a list with one array of predictions per classifier trained
-        - accuracies: the validation accuracies of the trained classifiers; this is a list with one measurement per classifier trained
+        - accuracies: validation accuracies, one per fold
+        - macro_f1_scores: optional macro-F1 values, one per fold
         
     """
     table = []
     for model_family, model_data in classifiers_data.items():
         for run, run_data in enumerate(model_data):
             for fold, acc in run_data['accuracies'].items():
-                table.append([model_family, acc, run, fold])
-    return pd.DataFrame(table, columns=['model', 'accuracy', 'run', 'fold'])
+                macro_f1 = run_data.get('macro_f1_scores', {}).get(fold, np.nan)
+                table.append([model_family, acc, macro_f1, run, fold])
+    return pd.DataFrame(
+        table,
+        columns=['model', 'accuracy', 'macro_f1', 'run', 'fold'],
+    )
 
 def plot_box_and_points(df, metric='accuracy', tickfmt="{x:.4f}"):
     """

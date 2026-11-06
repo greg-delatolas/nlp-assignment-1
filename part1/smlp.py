@@ -196,10 +196,10 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device="cpu"):
         "accuracy": total_correct / total_examples, # average accuracy
     }
 
-def evaluate(model, dataloader, criterion, device="cpu"):
+def evaluate(model, dataloader, criterion, device="cpu", verbose=False):
     """Evaluate the model without updating weights.
 
-    Inputs: model, eval dataloader, loss function, device.
+    Inputs: model, eval dataloader, loss function, device, and whether to show progress.
     Output: (metrics dict with loss/accuracy, numpy array of predicted labels).
     """
     if isinstance(device, str):
@@ -214,7 +214,13 @@ def evaluate(model, dataloader, criterion, device="cpu"):
     all_preds = []
     with torch.no_grad():  # no gradients needed for evaluation
 
-        for X_batch, y_batch in dataloader:
+        batches = tqdm(
+            dataloader,
+            desc="Evaluating",
+            leave=False,
+            disable=not verbose,
+        )
+        for X_batch, y_batch in batches:
             # move the batch to the device
             X_batch = X_batch.to(device) 
             y_batch = y_batch.to(device)
@@ -239,11 +245,12 @@ def evaluate(model, dataloader, criterion, device="cpu"):
 
 def train_neural_network_model(training_set, validation_set, num_classes, encoder, save_to,   
                                 hidden_dim=128, dropout=0.1, batch_size=64, learning_rate=1e-3, 
-                                weight_decay=1e-4, num_epochs=20, device=torch.device("cpu"), version='1'):
+                                weight_decay=1e-4, num_epochs=20, device=torch.device("cpu"), version='1',
+                                verbose=True):
     """Encode texts, train SparseMLP, and checkpoint the best validation model.
 
     Inputs: train/val (text, label) pairs, num_classes, encoder (text -> sparse vector), path prefix to save weights,
-            plus standard training hyperparameters.
+            standard training hyperparameters, and whether to print training progress.
     Process: vectorise documents, build sparse dataloaders, train for `num_epochs`, save best-by-val-loss.
     Output: per-epoch metrics list, best epoch index, and validation predictions from the best model.
     """
@@ -252,14 +259,16 @@ def train_neural_network_model(training_set, validation_set, num_classes, encode
         
     time_start = time.time()
     # Convert the training and validation sets to vectors
-    print("Transforming documents...")
+    if verbose:
+        print("Transforming documents...")
     training_vectors = [encoder(text) for text, label in training_set]
     training_labels = [int(label) for text, label in training_set]
     validation_vectors = [encoder(text) for text, label in validation_set]
     validation_labels = [int(label) for text, label in validation_set]
 
     time_document_to_vector = time.time()
-    print(f"Document transformation done! Time taken: {time_document_to_vector - time_start:.3f} seconds")
+    if verbose:
+        print(f"Document transformation done! Time taken: {time_document_to_vector - time_start:.3f} seconds")
     
     # Keep SciPy sparse here; conversion to torch happens in sparse_collate
     X_train_sparse = csr_matrix(training_vectors)
@@ -284,7 +293,8 @@ def train_neural_network_model(training_set, validation_set, num_classes, encode
     )
 
     time_dataloader = time.time()
-    print(f"Dataloader done! Time taken: {time_dataloader - time_document_to_vector:.3f} seconds")
+    if verbose:
+        print(f"Dataloader done! Time taken: {time_dataloader - time_document_to_vector:.3f} seconds")
 
     # save architecture-defining arguments
     with open(f"{save_to}.json", "w", encoding="utf-8") as f:
@@ -293,6 +303,7 @@ def train_neural_network_model(training_set, validation_set, num_classes, encode
             'hidden_dim': hidden_dim, 
             'num_classes': num_classes, 
             'dropout': dropout,
+            'version': version,
         }
         json.dump(args, f, indent=2, ensure_ascii=False)
         
@@ -302,28 +313,47 @@ def train_neural_network_model(training_set, validation_set, num_classes, encode
     elif version == '2':
         model = SparseMLP2(input_dim=len(encoder), hidden_dim=hidden_dim, num_classes=num_classes, dropout=dropout).to(device)
     else:
-        raise "Invalid Option!!!!"
+        raise ValueError(f"Unknown MLP version: {version}")
 
-    criterion = nn.NLLLoss() # create the loss function
+    # Balance the loss using only this fold's training-label distribution.
+    class_counts = torch.bincount(
+        torch.tensor(training_labels, dtype=torch.long),
+        minlength=num_classes,
+    ).float()
+    class_weights = torch.zeros_like(class_counts)
+    present_classes = class_counts > 0
+    class_weights[present_classes] = len(training_labels) / (
+        num_classes * class_counts[present_classes]
+    )
+
+    criterion = nn.NLLLoss(weight=class_weights.to(device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay) # create the optimizer
 
     metrics = []
-    print("Training...")
+    if verbose:
+        print("Training...")
     predictions = None
-    for epoch in tqdm(range(num_epochs)):
+    for epoch in tqdm(range(num_epochs), disable=not verbose):
         # Train the model for one epoch
         train_metrics = train_one_epoch(model, train_loader, optimizer, criterion, device)
         # Evaluate the model on the validation set
-        val_metrics, preds = evaluate(model, val_loader, criterion, device)
+        val_metrics, preds = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            verbose=False,
+        )
         # Store the metrics for this epoch
         metrics.append({"train_metrics": train_metrics, "val_metrics": val_metrics})
 
-        print(
-            f"Epoch {epoch + 1:02d} | "
-            f"train loss: {train_metrics['loss']:.4f} | "
-            f"train acc: {train_metrics['accuracy']:.4f} | "
-            f"val loss: {val_metrics['loss']:.4f} | "
-            f"val acc: {val_metrics['accuracy']:.4f}"
+        if verbose:
+            print(
+                f"Epoch {epoch + 1:02d} | "
+                f"train loss: {train_metrics['loss']:.4f} | "
+                f"train acc: {train_metrics['accuracy']:.4f} | "
+                f"val loss: {val_metrics['loss']:.4f} | "
+                f"val acc: {val_metrics['accuracy']:.4f}"
             )
         
         # Saving the best model according to validation loss
@@ -340,7 +370,8 @@ def train_neural_network_model(training_set, validation_set, num_classes, encode
             predictions = preds
     
     time_training = time.time()
-    print(f"Training done! Time taken: {time_training - time_dataloader:.3f} seconds")
+    if verbose:
+        print(f"Training done! Time taken: {time_training - time_dataloader:.3f} seconds")
 
     return metrics, best_epoch, predictions
 
@@ -352,6 +383,8 @@ def load(path, device="cpu"):
 
     with open(f"{path}.json", "r", encoding="utf-8") as f:
         args = json.load(f)
+
+    version = args.pop('version', '1')
     
     with open(f"{path}.pt", "rb") as f:
         state_dict = torch.load(f)
@@ -359,7 +392,12 @@ def load(path, device="cpu"):
     if isinstance(device, str):
         device = torch.device(device)
         
-    model = SparseMLP(**args)
+    if version == '1':
+        model = SparseMLP(**args)
+    elif version == '2':
+        model = SparseMLP2(**args)
+    else:
+        raise ValueError(f"Unknown MLP version: {version}")
     model.load_state_dict(state_dict)
     model = model.to(device)
     return model
