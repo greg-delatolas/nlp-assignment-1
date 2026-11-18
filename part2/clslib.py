@@ -454,7 +454,92 @@ class LSTMEncoder(nn.Module):
         packed = pack_padded_sequence(embedded, lengths.cpu(), batch_first=True, enforce_sorted=False) # sorting leads to even more efficient processing, but it is cumbersome and we skip it
         output, (hidden, cell) = self.lstm(packed)
         final_hidden = hidden[-1]
-        return final_hidden        
+        return final_hidden
+
+
+class LSTMEncoder2(nn.Module):
+    """
+    Generalisation of LSTMEncoder with a configurable number of stacked layers and
+    optional bidirectionality.
+
+    The text encoding is the final hidden state of the top layer. For a bidirectional
+    LSTM it is the concatenation of the top layer's forward state (after reading the
+    last token) and backward state (after reading the first token), so enc_dim is
+    2 * hidden_size.
+    """
+    def __init__(self, hidden_size, embedding_matrix, padding_idx=0, freeze_embeddings=True,
+                 word_dropout=0., num_layers=1, bidirectional=False, layer_dropout=0.):
+        """
+        hidden_size: size of the recurrent state (per direction)
+        embedding_matrix: word vectors
+        padding_idx: id of the pad token
+        freeze_embeddings: treat embeddings as frozen
+        word_dropout: probability of zeroing a (non-pad) word embedding during training
+        num_layers: number of stacked LSTM layers
+        bidirectional: also read each sequence right-to-left
+        layer_dropout: dropout applied between stacked LSTM layers (only used if num_layers > 1)
+        """
+        super().__init__()
+        _, embedding_dim = embedding_matrix.shape
+
+        self.embedding = nn.Embedding.from_pretrained(
+            embedding_matrix,
+            freeze=freeze_embeddings,
+            padding_idx=padding_idx
+        )
+        self.hidden_size = hidden_size
+        self.word_dropout = word_dropout
+        self.num_layers = num_layers
+        self.bidirectional = bidirectional
+
+        self.lstm = nn.LSTM(
+            input_size=embedding_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bidirectional=bidirectional,
+            # torch warns (and ignores it) if dropout > 0 with a single layer
+            dropout=layer_dropout if num_layers > 1 else 0.,
+            batch_first=True
+        )
+
+    @property
+    def enc_dim(self):
+        return self.hidden_size * (2 if self.bidirectional else 1)
+
+    @property
+    def pad_idx(self):
+        return self.embedding.padding_idx
+
+    def forward(self, x):
+        """
+        Encode each sequence in the batch into a single enc_dim-dimensional vector.
+
+        x: a batch of sequences of token ids [batch, max_seq_len]
+        """
+        # [batch, max_seq_len, emb_dim]
+        embedded = self.embedding(x)
+        valid = x.ne(self.embedding.padding_idx)
+
+        # Word dropout (see LSTMEncoder for the motivation)
+        if self.training and self.word_dropout > 0:
+            drop_mask = (
+                torch.rand(x.shape, device=embedded.device) < self.word_dropout
+            ) & valid
+            embedded = embedded.masked_fill(drop_mask.unsqueeze(-1), 0.0)
+
+        # pack_padded_sequence rejects zero-length sequences (e.g. a text whose tokens were all removed),
+        # so we let such a sequence read a single pad position instead
+        lengths = torch.sum(valid, dim=-1).clamp(min=1)
+        packed = pack_padded_sequence(embedded, lengths.cpu(), batch_first=True, enforce_sorted=False)
+        output, (hidden, cell) = self.lstm(packed)
+
+        # hidden: [num_layers * num_directions, batch, hidden_size], ordered layer by layer,
+        # and within a layer forward first, then backward
+        if self.bidirectional:
+            # top layer: forward state (hidden[-2]) and backward state (hidden[-1])
+            return torch.cat([hidden[-2], hidden[-1]], dim=-1)
+        return hidden[-1]
+
 
 class SoftmaxRegressor(nn.Module):
     """

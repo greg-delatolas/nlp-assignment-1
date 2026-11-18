@@ -174,6 +174,11 @@ def train(
              embedding_matrix=torch.tensor(emb_model.vectors, dtype=torch.float32), 
              **enc_kwargs
          )
+    elif enc_type == 'lstm2':
+         encoder = clslib.LSTMEncoder2(
+             embedding_matrix=torch.tensor(emb_model.vectors, dtype=torch.float32), 
+             **enc_kwargs
+         )
     else:
         raise ValueError(f"I do not know this encoder type: {enc_type}")    
 
@@ -237,6 +242,11 @@ def load(path, emb_model: clslib.PretrainedEmbeddings, device="cpu"):
          )
     elif args['enc_type'] == 'lstm':
          encoder = clslib.LSTMEncoder(
+             embedding_matrix=torch.tensor(emb_model.vectors, dtype=torch.float32), 
+             **args['enc_kwargs']
+         )
+    elif args['enc_type'] == 'lstm2':
+         encoder = clslib.LSTMEncoder2(
              embedding_matrix=torch.tensor(emb_model.vectors, dtype=torch.float32), 
              **args['enc_kwargs']
          )
