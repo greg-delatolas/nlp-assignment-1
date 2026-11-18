@@ -5,3 +5,8 @@
 *.pyc
 *.toml
 *.DS_Store
+
+# local experiment outputs (models, tables, figures, caches, optuna study)
+results/
+*.db
+*.pkl
