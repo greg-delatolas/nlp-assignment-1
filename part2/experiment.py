@@ -15,6 +15,21 @@ import json
 from . import clslib
 
 
+def class_weighted_nll_loss(training_labels, num_classes, device="cpu"):
+    """Create an NLL loss with inverse-frequency weights from training labels only."""
+    labels = torch.as_tensor(training_labels, dtype=torch.long)
+    if labels.numel() == 0:
+        raise ValueError("Cannot compute class weights from an empty training set.")
+    if torch.any(labels < 0) or torch.any(labels >= num_classes):
+        raise ValueError("Training labels must be in [0, num_classes).")
+
+    counts = torch.bincount(labels, minlength=num_classes).to(torch.float32)
+    weights = torch.zeros(num_classes, dtype=torch.float32)
+    present = counts > 0
+    weights[present] = labels.numel() / (num_classes * counts[present])
+    return nn.NLLLoss(weight=weights.to(device))
+
+
 class LabelledCorpus(Dataset):
     def __init__(self, X, y):
         """Receives a list of variable-length token-id sequences and labels."""
@@ -187,10 +202,14 @@ def train(
         **regressor_kwargs
     ).to(device)
     
-    criterion = nn.NLLLoss()
+    # Derive weights separately for every training fold. Validation/test labels
+    # must not influence the training objective.
+    criterion = class_weighted_nll_loss(training_labels, num_classes, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=opt_kwargs['learning_rate'], weight_decay=opt_kwargs['weight_decay'])
 
     metrics = []
+    best_val_loss = float("inf")
+    best_epoch = -1
     for epoch in tqdm(range(opt_kwargs['num_epochs'])):
         train_metrics = training_one_epoch(model, train_loader, optimizer, criterion, device)
         val_metrics = evaluate(model, val_loader, criterion, device)
@@ -204,13 +223,8 @@ def train(
             f"val acc: {val_metrics['accuracy']:.4f}"
             )
         
-        # Saving the best model according to validation loss
-        if epoch != 0:
-            if val_metrics["loss"] <= best_val_loss:
-                best_val_loss = val_metrics["loss"]
-                torch.save(model.state_dict(), f"{save_to}.pt")
-                best_epoch = epoch
-        else:
+        # Save the best model according to validation loss.
+        if val_metrics["loss"] <= best_val_loss:
             best_val_loss = val_metrics["loss"]
             torch.save(model.state_dict(), f"{save_to}.pt")
             best_epoch = epoch

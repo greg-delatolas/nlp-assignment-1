@@ -119,15 +119,23 @@
 
 1. Find a word embedding model that is appropriate for your dataset. Think about the language, the kind of text you are working with. Find evidence that your choice is a good one: 
     * Can you tokenize your texts in a way coherent with the definition of a token in the embedding model?
-    A: We tokenized using a word tokenizer, because the GloVe twitter is a word level embedding vector.
+      > A: We tokenized using a word tokenizer, because the GloVe twitter is a word level embedding vector.
     * Does the model's vocabulary give enough coverage to the words in your texts? etc.
-    A: Yes, check the analysis at project.ipynb
+      > A : Yes, check the analysis at project.ipynb
 2. Explore what your chosen word embedding model captures. Some things you might consider: 
     * Is it good at representing interesting similarities (re to your choice of task)? J
-    A: Analysis on GloVe twitter vs GloVe Wikipedia.
+      > A: Analysis on GloVe twitter vs GloVe Wikipedia.
+      ![gram matrix of twitter vs wikipeia embeddings](image.png)
     * Have you found task-specific evidence that it's better than some other reasonable alternative?
+      > A: Experiments on glove twitter and glove wikipedia
+      ![alt text](image-1.png)
     * Do you know about limitations of this model?
+      > A: 
+      > 1. GloVe Twitter is a static, word-level embedding model. Each word receives one fixed vector regardless of its context, so it cannot distinguish different meanings of the same word.
+      > 2. It also cannot construct representations for unseen words from subword information: misspellings, unusual contractions, hashtags, or rare words are mapped to the same unknown vector.
+      > 3. Its Twitter training data may also contain noise and social biases. For example, words referring to particular genders, ethnicities, religions, or social groups may become unfairly associated with emotions such as anger or fear.
     * Any limitations that you find particularly troubling for your task? 
+      > A: 1,3 from above.
 3. Experiment with the embed-and-pool approach.  
     * What design choices have meaningful impact in classification performance (eg, embedding size, architecture design, optimisation parameters), if any?
     * Is this better than what you could achieve last week? In other words, did pretrained embeddings add to your design?
