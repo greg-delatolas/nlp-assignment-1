@@ -12,6 +12,9 @@ from pathlib import Path
 import itertools
 import json
 
+import torch.nn.functional as F
+from sklearn.metrics import f1_score
+
 from . import clslib
 
 
@@ -50,6 +53,22 @@ def collate_labelled_texts(batched_pairs, padding_value=0):
     return X_batch, y_batch
 
 
+def _loss_sum_and_weight(logprobs, y_batch, criterion, batch_loss):
+    """
+    Return (sum of per-example losses, total example weight) for one batch.
+
+    For an NLLLoss with class weights, torch averages a batch as sum(w_i * l_i) / sum(w_i).
+    Accumulating these two sums over all batches gives the exact weighted mean over the whole
+    dataset, which `batch_mean * batch_size` does not when batches differ in class mix.
+    """
+    if isinstance(criterion, nn.NLLLoss):
+        weight = criterion.weight
+        loss_sum = F.nll_loss(logprobs, y_batch, weight=weight, reduction="sum").item()
+        total_weight = weight[y_batch].sum().item() if weight is not None else float(y_batch.size(0))
+        return loss_sum, total_weight
+    return batch_loss.item() * y_batch.size(0), float(y_batch.size(0))
+
+
 def training_one_epoch(model, dataloader, optimizer, criterion, device="cpu"):
     if isinstance(device, str):
         device = torch.device(device)
@@ -57,6 +76,7 @@ def training_one_epoch(model, dataloader, optimizer, criterion, device="cpu"):
     model.train()
 
     total_loss = 0.0
+    total_weight = 0.0
     total_correct = 0
     total_examples = 0
 
@@ -70,13 +90,15 @@ def training_one_epoch(model, dataloader, optimizer, criterion, device="cpu"):
         loss.backward()
         optimizer.step()
 
-        total_loss += loss.item() * y_batch.size(0)
+        loss_sum, batch_weight = _loss_sum_and_weight(logprobs.detach(), y_batch, criterion, loss)
+        total_loss += loss_sum
+        total_weight += batch_weight
         predictions = logprobs.argmax(dim=1)
         total_correct += (predictions == y_batch).sum().item()
         total_examples += y_batch.size(0)
 
     return {
-        "loss": total_loss / total_examples,
+        "loss": total_loss / total_weight,
         "accuracy": total_correct / total_examples,
     }
 
@@ -87,6 +109,7 @@ def evaluate(model, dataloader, criterion, device="cpu"):
     model.eval()
 
     total_loss = 0.0
+    total_weight = 0.0
     total_correct = 0
     total_examples = 0
 
@@ -100,18 +123,23 @@ def evaluate(model, dataloader, criterion, device="cpu"):
             logprobs = model(X_batch)
             loss = criterion(logprobs, y_batch)
 
-            total_loss += loss.item() * y_batch.size(0)
+            loss_sum, batch_weight = _loss_sum_and_weight(logprobs, y_batch, criterion, loss)
+            total_loss += loss_sum
+            total_weight += batch_weight
             predictions = logprobs.argmax(dim=1)
             total_correct += (predictions == y_batch).sum().item()
             total_examples += y_batch.size(0)
             preds_list.append(predictions.tolist())
             labels_list.append(y_batch.tolist())
 
+    flat_predictions = list(itertools.chain.from_iterable(preds_list))
+    flat_labels = list(itertools.chain.from_iterable(labels_list))
     return {
         "predictions": preds_list,
         "labels": labels_list,
-        "loss": total_loss / total_examples,
+        "loss": total_loss / total_weight,
         "accuracy": total_correct / total_examples,
+        "macro_f1": f1_score(flat_labels, flat_predictions, average="macro", zero_division=0),
     }
 
 def train(
@@ -127,9 +155,22 @@ def train(
     opt_kwargs={'learning_rate': 1e-3, 'weight_decay': 1e-4, 'batch_size': 64, 'num_epochs': 20},    
     device='cpu'
 ):
-    """Receives a training set and a validation set and returns a trained neural network model"""
+    """
+    Receives a training set and a validation set and returns (metrics per epoch, best epoch).
 
-    # 6
+    Besides learning_rate, weight_decay, batch_size and num_epochs, opt_kwargs accepts:
+        - selection_metric: "loss" (default, lowest validation loss, as in the tutorial) or
+          "macro_f1" (highest validation macro-F1); the best epoch's weights are saved
+        - patience: stop after this many epochs without improvement of the selection metric
+          (default None: always train for num_epochs)
+        - class_weighted: use inverse-frequency class weights computed from the training labels
+          (default False, as in the tutorial)
+    """
+    selection_metric = opt_kwargs.get("selection_metric", "loss")
+    patience = opt_kwargs.get("patience")
+    class_weighted = opt_kwargs.get("class_weighted", False)
+    if selection_metric not in ("loss", "macro_f1"):
+        raise ValueError(f"Unknown selection_metric: {selection_metric}")
     
     time_start = time.time()
 
@@ -202,14 +243,19 @@ def train(
         **regressor_kwargs
     ).to(device)
     
-    # Derive weights separately for every training fold. Validation/test labels
-    # must not influence the training objective.
-    criterion = class_weighted_nll_loss(training_labels, num_classes, device)
+    # Class weights (if used) are derived from this training set only, so validation/test
+    # labels never influence the training objective.
+    if class_weighted:
+        criterion = class_weighted_nll_loss(training_labels, num_classes, device)
+    else:
+        criterion = nn.NLLLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=opt_kwargs['learning_rate'], weight_decay=opt_kwargs['weight_decay'])
 
     metrics = []
     best_val_loss = float("inf")
+    best_val_f1 = -float("inf")
     best_epoch = -1
+    epochs_without_improvement = 0
     for epoch in tqdm(range(opt_kwargs['num_epochs'])):
         train_metrics = training_one_epoch(model, train_loader, optimizer, criterion, device)
         val_metrics = evaluate(model, val_loader, criterion, device)
@@ -220,14 +266,26 @@ def train(
             f"train loss: {train_metrics['loss']:.4f} | "
             f"train acc: {train_metrics['accuracy']:.4f} | "
             f"val loss: {val_metrics['loss']:.4f} | "
-            f"val acc: {val_metrics['accuracy']:.4f}"
+            f"val acc: {val_metrics['accuracy']:.4f} | "
+            f"val macro-F1: {val_metrics['macro_f1']:.4f}"
             )
         
-        # Save the best model according to validation loss.
-        if val_metrics["loss"] <= best_val_loss:
-            best_val_loss = val_metrics["loss"]
+        # Save the best model according to the selection metric.
+        if selection_metric == "loss":
+            improved = val_metrics["loss"] <= best_val_loss
+        else:
+            improved = val_metrics["macro_f1"] > best_val_f1 + 1e-4
+        if improved:
+            best_val_loss = min(best_val_loss, val_metrics["loss"])
+            best_val_f1 = max(best_val_f1, val_metrics["macro_f1"])
             torch.save(model.state_dict(), f"{save_to}.pt")
             best_epoch = epoch
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+            if patience is not None and epochs_without_improvement >= patience:
+                print(f"Early stopping after epoch {epoch + 1} (best epoch: {best_epoch + 1})")
+                break
     
     time_training = time.time()
     print(f"Training done! Time taken: {time_training - time_dataloader:.3f} seconds")
@@ -303,6 +361,7 @@ def cross_validation(
     """
 
     models, predictions, accuracies = OrderedDict(), OrderedDict(), OrderedDict()
+    best_epochs, epochs_run = OrderedDict(), OrderedDict()
     
     for fold in tqdm(data_splits.keys()):
         training_set = data_splits[fold]["training"]
@@ -327,8 +386,13 @@ def cross_validation(
         models[fold] = f'{fold_folder}/model'
         accuracies[fold] = metrics[best_epoch]['val_metrics']['accuracy'] 
         predictions[fold] = np.array(list(itertools.chain.from_iterable(metrics[best_epoch]['val_metrics']['predictions'])))
+        best_epochs[fold] = best_epoch + 1   # 1-based
+        epochs_run[fold] = len(metrics)
 
-    return {'models': models, 'predictions': predictions, 'accuracies': accuracies}    
+    return {
+        'models': models, 'predictions': predictions, 'accuracies': accuracies,
+        'best_epochs': best_epochs, 'epochs_run': epochs_run,
+    }    
 
 def predict_logprobs(   
     model: clslib.SoftmaxRegressor,    
